@@ -1,6 +1,20 @@
 use std::{process::exit, sync::LazyLock};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
+struct ASTStmt {}
+
+#[derive(Default, Debug)]
+struct ASTFuncDef {
+    name: String,
+    body: Vec<ASTStmt>,
+}
+
+#[derive(Debug)]
+enum ASTNode {
+    FuncDef(ASTFuncDef),
+}
+
+#[derive(Debug, PartialEq, Clone)]
 enum Token {
     Ident(String),
     Fn,
@@ -18,6 +32,7 @@ struct Compiler {
     src: Vec<u8>,
     index: usize,
     line: usize,
+    program: Vec<ASTNode>,
 }
 
 impl Compiler {
@@ -27,6 +42,7 @@ impl Compiler {
             src: src.into_bytes(),
             index: 0,
             line: 1,
+            program: Vec::new(),
         }
     }
 
@@ -99,13 +115,95 @@ impl Compiler {
             }
         }
     }
+
+    fn build_ast(&mut self) {
+        self.lexe();
+
+        while self.cur_tok != Token::EOF {
+            match self.cur_tok {
+                Token::Fn => self.parse_fn_def(),
+                _ => {
+                    println!(
+                        "ERROR [line: {}]: Unexcpeted operation in global scope: {:?}",
+                        self.line, self.cur_tok
+                    );
+                    exit(1);
+                }
+            }
+            self.lexe();
+        }
+    }
+
+    fn parse_fn_def(&mut self) {
+        self.lexe();
+
+        let mut function = ASTFuncDef::default();
+
+        if let Token::Ident(ref name) = self.cur_tok {
+            function.name = name.to_string();
+        } else {
+            println!(
+                "ERROR [line: {}]: Excpected a function name got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+
+        self.lexe();
+        if self.cur_tok != Token::OpenParen {
+            println!(
+                "ERROR [line: {}]: Excpected '(' after function name got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+
+        self.lexe();
+        if self.cur_tok != Token::CloseParen {
+            println!(
+                "ERROR [line: {}]: Excpected ')' after function name got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+
+        self.lexe();
+        if self.cur_tok != Token::OpenCurly {
+            println!(
+                "ERROR [line: {}]: Excpected '{{' after function name got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+
+        self.lexe();
+        while self.cur_tok != Token::CloseCurly {
+            function.body.push(self.parse_stmt());
+        }
+
+        self.program.push(ASTNode::FuncDef(function));
+    }
+
+    fn parse_stmt(&mut self) -> ASTStmt {
+        match &self.cur_tok {
+            Token::Ident(str) => {
+                println!("Hey {}", str)
+            }
+            _ => {
+                println!(
+                    "ERROR [line: {}]: Unknow statement: {:?}",
+                    self.line, self.cur_tok
+                );
+                exit(1);
+            }
+        }
+        self.lexe();
+        ASTStmt {}
+    }
 }
 
 fn main() {
     let mut remc = Compiler::new(String::from("fn main() {}"));
-    remc.lexe();
-    while remc.cur_tok != Token::EOF {
-        println!("Tok; {:?}", remc.cur_tok);
-        remc.lexe();
-    }
+    remc.build_ast();
+    println!("{:#?}", remc.program);
 }
