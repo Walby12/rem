@@ -1,5 +1,24 @@
 use std::{process::exit, sync::LazyLock};
 
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// The input source file (.rem) to compile
+    #[arg(required = true)]
+    input_file: PathBuf,
+
+    /// Print the Abstract Syntax Tree (AST) debug dump in stdout
+    #[arg(long, default_value_t = false)]
+    ast: bool,
+
+    /// Specify the name of the output executable binary
+    #[arg(short, long, default_value = "out.exe")]
+    output: String,
+}
+
 #[derive(Debug)]
 struct ASTStmt {}
 
@@ -203,7 +222,29 @@ impl Compiler {
 }
 
 fn main() {
-    let mut remc = Compiler::new(String::from("fn main() {}"));
+    let args = Args::parse();
+
+    match args.input_file.extension() {
+        Some(ext) if ext == "rem" => {}
+        _ => {
+            eprintln!("ERROR: Invalid file extension. The Rem compiler only accepts .rem files.");
+            exit(1);
+        }
+    }
+
+    if !args.input_file.exists() {
+        println!(
+            "ERROR: could not find file {}",
+            args.input_file.to_string_lossy()
+        );
+        exit(1);
+    }
+    let src = std::fs::read_to_string(args.input_file).unwrap();
+
+    let mut remc = Compiler::new(src);
     remc.build_ast();
-    println!("{:#?}", remc.program);
+
+    if args.ast {
+        println!("{:#?}", remc.program);
+    }
 }
