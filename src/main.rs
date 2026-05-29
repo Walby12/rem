@@ -10,7 +10,7 @@ struct Args {
     #[arg(required = true)]
     input_file: PathBuf,
 
-    /// Print the Abstract Syntax Tree (AST) debug dump in stdout
+    /// Dumps the AST in the stdout
     #[arg(long, default_value_t = false)]
     ast: bool,
 
@@ -19,8 +19,17 @@ struct Args {
     output: String,
 }
 
+#[derive(Default, Debug)]
+struct ASTLetStmt {
+    var_name: String,
+    value: i32,
+}
+
 #[derive(Debug)]
-struct ASTStmt {}
+enum ASTStmt {
+    Empty,
+    LetStmt(ASTLetStmt),
+}
 
 #[derive(Default, Debug)]
 struct ASTFuncDef {
@@ -36,7 +45,11 @@ enum ASTNode {
 #[derive(Debug, PartialEq, Clone)]
 enum Token {
     Ident(String),
+    Int(i32),
     Fn,
+    Let,
+    Equals,
+    Semicolon,
     OpenParen,
     CloseParen,
     OpenCurly,
@@ -44,7 +57,7 @@ enum Token {
     EOF,
 }
 
-static KEY_CHARS: LazyLock<Vec<u8>> = LazyLock::new(|| vec![b'(', b')', b'{', b'}']);
+static KEY_CHARS: LazyLock<Vec<u8>> = LazyLock::new(|| vec![b'(', b')', b'{', b'}', b'=', b';']);
 
 struct Compiler {
     cur_tok: Token,
@@ -97,6 +110,14 @@ impl Compiler {
                 self.cur_tok = Token::CloseCurly;
                 self.index += 1;
             }
+            b'=' => {
+                self.cur_tok = Token::Equals;
+                self.index += 1;
+            }
+            b';' => {
+                self.cur_tok = Token::Semicolon;
+                self.index += 1;
+            }
             _ => {
                 if c.is_ascii_alphabetic() {
                     let mut buff: Vec<u8> = Vec::new();
@@ -117,8 +138,30 @@ impl Compiler {
                     match String::from_utf8(buff) {
                         Ok(str) => match str.as_str() {
                             "fn" => self.cur_tok = Token::Fn,
+                            "let" => self.cur_tok = Token::Let,
                             _ => self.cur_tok = Token::Ident(str),
                         },
+                        Err(e) => {
+                            println!("ERROR [line: {}]: Invalid UTF-8 bytes: {}", self.line, e);
+                            exit(1);
+                        }
+                    }
+                } else if c.is_ascii_digit() {
+                    let mut buff: Vec<u8> = Vec::new();
+
+                    while self.index < self.src.len() {
+                        let current_byte = self.src[self.index];
+
+                        if current_byte.is_ascii_digit() && !KEY_CHARS.contains(&current_byte) {
+                            buff.push(current_byte);
+                            self.index += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    match String::from_utf8(buff) {
+                        Ok(str) => self.cur_tok = Token::Int(str.parse().unwrap()),
                         Err(e) => {
                             println!("ERROR [line: {}]: Invalid UTF-8 bytes: {}", self.line, e);
                             exit(1);
@@ -204,9 +247,11 @@ impl Compiler {
     }
 
     fn parse_stmt(&mut self) -> ASTStmt {
+        let mut stmt = ASTStmt::Empty;
+
         match &self.cur_tok {
-            Token::Ident(str) => {
-                println!("Hey {}", str)
+            Token::Let => {
+                stmt = self.parse_let_stmt();
             }
             _ => {
                 println!(
@@ -216,8 +261,54 @@ impl Compiler {
                 exit(1);
             }
         }
+
+        if self.cur_tok != Token::Semicolon {
+            println!(
+                "ERROR [line: {}]: Excpected ';' after statement got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+
         self.lexe();
-        ASTStmt {}
+        stmt
+    }
+    fn parse_let_stmt(&mut self) -> ASTStmt {
+        let mut variable = ASTLetStmt::default();
+        self.lexe();
+
+        if let Token::Ident(ref name) = self.cur_tok {
+            variable.var_name = name.to_string();
+        } else {
+            println!(
+                "ERROR [line: {}]: Excpected a variable name got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+
+        self.lexe();
+        if self.cur_tok != Token::Equals {
+            println!(
+                "ERROR [line: {}]: Excpected '=' after variable name got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+
+        self.lexe();
+        if let Token::Int(num) = self.cur_tok {
+            variable.value = num;
+        } else {
+            println!(
+                "ERROR [line: {}]: Excpected a number after '=' got: {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+        self.lexe();
+
+        ASTStmt::LetStmt(variable)
     }
 }
 
