@@ -1,4 +1,5 @@
-use std::{process::exit, sync::LazyLock};
+use std::{fs::*, io::prelude::*, io::*, process::exit, sync::LazyLock};
+use wasmtime::{Engine, Module};
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -15,8 +16,12 @@ struct Args {
     ast: bool,
 
     /// Specify the name of the output executable binary
-    #[arg(short, long, default_value = "out.exe")]
+    #[arg(short, long, default_value = "")]
     output: String,
+
+    /// Autorun the final executable program
+    #[arg(short, long, default_value_t = false)]
+    run: bool,
 }
 
 #[derive(Default, Debug)]
@@ -27,7 +32,6 @@ struct ASTLetStmt {
 
 #[derive(Debug)]
 enum ASTStmt {
-    Empty,
     LetStmt(ASTLetStmt),
 }
 
@@ -126,7 +130,7 @@ impl Compiler {
                         let current_byte = self.src[self.index];
 
                         if current_byte.is_ascii_alphanumeric()
-                            && !KEY_CHARS.contains(&current_byte)
+                            || current_byte == b'_' && !KEY_CHARS.contains(&current_byte)
                         {
                             buff.push(current_byte);
                             self.index += 1;
@@ -247,7 +251,7 @@ impl Compiler {
     }
 
     fn parse_stmt(&mut self) -> ASTStmt {
-        let mut stmt = ASTStmt::Empty;
+        let stmt;
 
         match &self.cur_tok {
             Token::Let => {
@@ -312,8 +316,52 @@ impl Compiler {
     }
 }
 
+struct Backend {
+    module_name: String,
+    program: Vec<ASTNode>,
+    wat_file: File,
+}
+
+impl Backend {
+    fn new(wat_file_name: String, module_name: String, program: Vec<ASTNode>) -> Backend {
+        let wat_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(wat_file_name)
+            .unwrap();
+
+        Backend {
+            module_name,
+            program,
+            wat_file,
+        }
+    }
+
+    fn compile_program(&mut self) {
+        self.wat_file.write_all(b"(module)").unwrap();
+        self.wat_file.flush().unwrap();
+        self.wat_file.seek(SeekFrom::Start(0)).unwrap();
+    }
+}
+
 fn main() {
     let args = Args::parse();
+
+    let output_file = if args.output.is_empty() {
+        let mut path = PathBuf::from("out");
+        if std::env::consts::OS == "windows" {
+            path.set_extension("exe");
+        }
+        path.to_string_lossy().into_owned()
+    } else {
+        if std::env::consts::OS == "windows" && !args.output.ends_with(".exe") {
+            format!("{}.exe", args.output)
+        } else {
+            args.output
+        }
+    };
 
     match args.input_file.extension() {
         Some(ext) if ext == "rem" => {}
@@ -337,5 +385,38 @@ fn main() {
 
     if args.ast {
         println!("{:#?}", remc.program);
+    }
+
+    let mut wat_path = PathBuf::from(&output_file);
+    wat_path.set_extension("wat");
+    let wat_filename = wat_path.to_string_lossy().into_owned();
+
+    let mut wasm_path = PathBuf::from(&output_file);
+    wasm_path.set_extension("wasm");
+    let wasm_filename = wasm_path.to_string_lossy().into_owned();
+
+    let mut backend = Backend::new(wat_filename, String::from("main"), remc.program);
+    backend.compile_program();
+
+    let mut wat_text = String::new();
+    backend.wat_file.read_to_string(&mut wat_text).unwrap();
+
+    let wasm_bytes = wat::parse_str(wat_text).unwrap();
+    std::fs::write(&wasm_filename, &wasm_bytes).unwrap();
+
+    let engine = Engine::default();
+
+    let module = Module::new(&engine, &wasm_bytes).expect("Failed to compile WASM module");
+    let native_exe_bytes = module
+        .serialize()
+        .expect("Failed to serialize native machine code");
+
+    write(&output_file, &native_exe_bytes).unwrap();
+
+    if args.run {
+        std::process::Command::new("wasmtime")
+            .args(&["run", "--allow-precompiled", &output_file])
+            .status()
+            .expect("Failed to execute wasmtime runner");
     }
 }
