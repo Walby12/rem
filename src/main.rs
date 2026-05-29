@@ -24,24 +24,32 @@ struct Args {
     run: bool,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct ASTLetStmt {
     var_name: String,
     value: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ASTStmt {
     LetStmt(ASTLetStmt),
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
+enum ASTType {
+    #[default]
+    Void,
+    I32,
+}
+
+#[derive(Default, Debug, Clone)]
 struct ASTFuncDef {
     name: String,
+    return_type: ASTType,
     body: Vec<ASTStmt>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ASTNode {
     FuncDef(ASTFuncDef),
 }
@@ -234,9 +242,24 @@ impl Compiler {
         }
 
         self.lexe();
+        if let Token::Ident(ref ret_type) = self.cur_tok {
+            match ret_type.as_str() {
+                "i32" => function.return_type = ASTType::I32,
+                "void" => function.return_type = ASTType::Void,
+                _ => {
+                    println!(
+                        "ERROR [line: {}]: Unknow return type: {}",
+                        self.line, ret_type
+                    );
+                    exit(1);
+                }
+            }
+            self.lexe();
+        }
+
         if self.cur_tok != Token::OpenCurly {
             println!(
-                "ERROR [line: {}]: Excpected '{{' after function name got: {:?}",
+                "ERROR [line: {}]: Excpected '{{' after function name or function return type got: {:?}",
                 self.line, self.cur_tok
             );
             exit(1);
@@ -277,6 +300,7 @@ impl Compiler {
         self.lexe();
         stmt
     }
+
     fn parse_let_stmt(&mut self) -> ASTStmt {
         let mut variable = ASTLetStmt::default();
         self.lexe();
@@ -340,9 +364,60 @@ impl Backend {
     }
 
     fn compile_program(&mut self) {
-        self.wat_file.write_all(b"(module)").unwrap();
+        self.wat_file.write_all(b"(module\n").unwrap();
+        let program = self.program.clone();
+
+        for ast in &program {
+            match ast {
+                ASTNode::FuncDef(func) => self.compile_func_def(func),
+            }
+        }
+        self.wat_file.write_all(b")\n").unwrap();
+
         self.wat_file.flush().unwrap();
         self.wat_file.seek(SeekFrom::Start(0)).unwrap();
+    }
+
+    fn compile_func_def(&mut self, func: &ASTFuncDef) {
+        let output = format!(
+            "\t(func ${} (export \"{}\"){}\n",
+            func.name,
+            func.name,
+            self.type_to_string(&func.return_type)
+        );
+
+        self.wat_file.write_all(output.as_bytes()).unwrap();
+
+        for stmt in &func.body {
+            if let ASTStmt::LetStmt(variable) = stmt {
+                writeln!(self.wat_file, "\t\t(local ${} i32)", variable.var_name).unwrap();
+            }
+        }
+
+        for stmt in &func.body {
+            self.compile_stmt(stmt);
+        }
+
+        self.wat_file.write_all(b"\t)\n").unwrap();
+    }
+
+    fn compile_stmt(&mut self, stmt: &ASTStmt) {
+        match stmt {
+            ASTStmt::LetStmt(variable) => {
+                let mut output = format!("\t\ti32.const {}\n", variable.value);
+                self.wat_file.write_all(output.as_bytes()).unwrap();
+
+                output = format!("\t\tlocal.set ${}\n", variable.var_name);
+                self.wat_file.write_all(output.as_bytes()).unwrap();
+            }
+        }
+    }
+
+    fn type_to_string(&mut self, r#type: &ASTType) -> String {
+        match r#type {
+            &ASTType::I32 => String::from("(result i32)"),
+            &ASTType::Void => String::from(""),
+        }
     }
 }
 
