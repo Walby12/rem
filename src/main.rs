@@ -1,4 +1,4 @@
-use std::{fs::*, io::prelude::*, io::*, process::exit, sync::LazyLock};
+use std::{collections::HashMap, fs::*, io::prelude::*, io::*, process::exit, sync::LazyLock};
 use wasmtime::{Engine, Module};
 
 use clap::Parser;
@@ -24,15 +24,79 @@ struct Args {
     run: bool,
 }
 
+#[derive(Debug, Clone)]
+struct Symbol {
+    pub name: String,
+    pub data_type: ASTType,
+}
+
+#[derive(Default, Debug, Clone)]
+struct SymbolTable {
+    pub entries: HashMap<String, Symbol>,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, name: String, data_type: ASTType) -> bool {
+        if self.entries.contains_key(&name) {
+            return false;
+        }
+        self.entries
+            .insert(name.clone(), Symbol { name, data_type });
+        true
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<&Symbol> {
+        self.entries.get(name)
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone)]
+enum ASTExpr {
+    Int(i32),
+    Variable(String),
+    Binary(Box<ASTExpr>, BinaryOp, Box<ASTExpr>),
+}
+
+impl Default for ASTExpr {
+    fn default() -> Self {
+        ASTExpr::Int(0)
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 struct ASTLetStmt {
     var_name: String,
-    value: i32,
+    value: ASTExpr,
+}
+
+#[derive(Default, Debug, Clone)]
+struct ASTReturnStmt {
+    value: ASTExpr,
+    function_ret_type: ASTType,
 }
 
 #[derive(Debug, Clone)]
 enum ASTStmt {
     LetStmt(ASTLetStmt),
+    ReturnStmt(ASTReturnStmt),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -58,6 +122,7 @@ enum ASTNode {
 enum Token {
     Ident(String),
     Int(i32),
+    Return,
     Fn,
     Let,
     Equals,
@@ -66,10 +131,15 @@ enum Token {
     CloseParen,
     OpenCurly,
     CloseCurly,
+    Plus,
+    Minus,
+    Asterisk,
+    Slash,
     EOF,
 }
 
-static KEY_CHARS: LazyLock<Vec<u8>> = LazyLock::new(|| vec![b'(', b')', b'{', b'}', b'=', b';']);
+static KEY_CHARS: LazyLock<Vec<u8>> =
+    LazyLock::new(|| vec![b'(', b')', b'{', b'}', b'=', b';', b'+', b'-', b'*', b'/']);
 
 struct Compiler {
     cur_tok: Token,
@@ -77,6 +147,7 @@ struct Compiler {
     index: usize,
     line: usize,
     program: Vec<ASTNode>,
+    vars: SymbolTable,
 }
 
 impl Compiler {
@@ -87,6 +158,7 @@ impl Compiler {
             index: 0,
             line: 1,
             program: Vec::new(),
+            vars: SymbolTable::new(),
         }
     }
 
@@ -130,6 +202,22 @@ impl Compiler {
                 self.cur_tok = Token::Semicolon;
                 self.index += 1;
             }
+            b'+' => {
+                self.cur_tok = Token::Plus;
+                self.index += 1;
+            }
+            b'-' => {
+                self.cur_tok = Token::Minus;
+                self.index += 1;
+            }
+            b'*' => {
+                self.cur_tok = Token::Asterisk;
+                self.index += 1;
+            }
+            b'/' => {
+                self.cur_tok = Token::Slash;
+                self.index += 1;
+            }
             _ => {
                 if c.is_ascii_alphabetic() {
                     let mut buff: Vec<u8> = Vec::new();
@@ -151,6 +239,7 @@ impl Compiler {
                         Ok(str) => match str.as_str() {
                             "fn" => self.cur_tok = Token::Fn,
                             "let" => self.cur_tok = Token::Let,
+                            "return" => self.cur_tok = Token::Return,
                             _ => self.cur_tok = Token::Ident(str),
                         },
                         Err(e) => {
@@ -265,20 +354,24 @@ impl Compiler {
             exit(1);
         }
 
+        self.vars.clear();
         self.lexe();
         while self.cur_tok != Token::CloseCurly {
-            function.body.push(self.parse_stmt());
+            function.body.push(self.parse_stmt(&function.return_type));
         }
 
         self.program.push(ASTNode::FuncDef(function));
     }
 
-    fn parse_stmt(&mut self) -> ASTStmt {
+    fn parse_stmt(&mut self, return_type: &ASTType) -> ASTStmt {
         let stmt;
 
         match &self.cur_tok {
             Token::Let => {
                 stmt = self.parse_let_stmt();
+            }
+            Token::Return => {
+                stmt = self.parse_return_stmt(return_type);
             }
             _ => {
                 println!(
@@ -299,6 +392,29 @@ impl Compiler {
 
         self.lexe();
         stmt
+    }
+
+    fn parse_return_stmt(&mut self, return_type: &ASTType) -> ASTStmt {
+        let mut r#return = ASTReturnStmt::default();
+        self.lexe();
+
+        match return_type {
+            &ASTType::Void => {
+                if self.cur_tok != Token::Semicolon {
+                    println!(
+                        "ERROR [line: {}]: Excpected empty return statement for void function got: {:?}",
+                        self.line, self.cur_tok
+                    );
+                    exit(1);
+                }
+            }
+            &ASTType::I32 => {
+                r#return.value = self.parse_expr(0);
+            }
+        }
+
+        r#return.function_ret_type = return_type.clone();
+        return ASTStmt::ReturnStmt(r#return);
     }
 
     fn parse_let_stmt(&mut self) -> ASTStmt {
@@ -325,29 +441,91 @@ impl Compiler {
         }
 
         self.lexe();
-        if let Token::Int(num) = self.cur_tok {
-            variable.value = num;
-        } else {
-            println!(
-                "ERROR [line: {}]: Excpected a number after '=' got: {:?}",
-                self.line, self.cur_tok
-            );
-            exit(1);
-        }
-        self.lexe();
+        variable.value = self.parse_expr(0);
+
+        self.vars.insert(variable.var_name.clone(), ASTType::I32);
 
         ASTStmt::LetStmt(variable)
+    }
+
+    fn token_precedence(&self, tok: &Token) -> u32 {
+        match tok {
+            Token::Plus | Token::Minus => 1,
+            Token::Asterisk | Token::Slash => 2,
+            _ => 0,
+        }
+    }
+
+    fn parse_expr(&mut self, min_precedence: u32) -> ASTExpr {
+        let mut left = match self.cur_tok.clone() {
+            Token::Int(val) => {
+                self.lexe();
+                ASTExpr::Int(val)
+            }
+            Token::Ident(name) => {
+                if self.vars.lookup(&name).is_none() {
+                    println!(
+                        "ERROR [line: {}]: Use of undeclared identifier '{}'",
+                        self.line, name
+                    );
+                    exit(1);
+                }
+                self.lexe();
+                ASTExpr::Variable(name)
+            }
+            Token::OpenParen => {
+                self.lexe();
+                let expr = self.parse_expr(0);
+                if self.cur_tok != Token::CloseParen {
+                    println!(
+                        "ERROR [line: {}]: Expected matching ')' close brace",
+                        self.line
+                    );
+                    exit(1);
+                }
+                self.lexe();
+                expr
+            }
+            _ => {
+                println!(
+                    "ERROR [line: {}]: Expected value expression expression component, got: {:?}",
+                    self.line, self.cur_tok
+                );
+                exit(1);
+            }
+        };
+
+        loop {
+            let prec = self.token_precedence(&self.cur_tok);
+            if prec == 0 || prec <= min_precedence {
+                break;
+            }
+
+            let op = match self.cur_tok {
+                Token::Plus => BinaryOp::Add,
+                Token::Minus => BinaryOp::Sub,
+                Token::Asterisk => BinaryOp::Mul,
+                Token::Slash => BinaryOp::Div,
+                _ => break,
+            };
+
+            self.lexe();
+
+            let right = self.parse_expr(prec);
+            left = ASTExpr::Binary(Box::new(left), op, Box::new(right));
+        }
+
+        left
     }
 }
 
 struct Backend {
-    module_name: String,
     program: Vec<ASTNode>,
     wat_file: File,
 }
 
 impl Backend {
-    fn new(wat_file_name: String, module_name: String, program: Vec<ASTNode>) -> Backend {
+    fn new(wat_file_name: String, program: Vec<ASTNode>) -> Backend {
         let wat_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -356,11 +534,7 @@ impl Backend {
             .open(wat_file_name)
             .unwrap();
 
-        Backend {
-            module_name,
-            program,
-            wat_file,
-        }
+        Backend { program, wat_file }
     }
 
     fn compile_program(&mut self) {
@@ -404,11 +578,44 @@ impl Backend {
     fn compile_stmt(&mut self, stmt: &ASTStmt) {
         match stmt {
             ASTStmt::LetStmt(variable) => {
-                let mut output = format!("\t\ti32.const {}\n", variable.value);
-                self.wat_file.write_all(output.as_bytes()).unwrap();
+                self.compile_expr(&variable.value);
 
-                output = format!("\t\tlocal.set ${}\n", variable.var_name);
+                let output = format!("\t\tlocal.set ${}\n", variable.var_name);
                 self.wat_file.write_all(output.as_bytes()).unwrap();
+            }
+            ASTStmt::ReturnStmt(r#return) => match r#return.function_ret_type {
+                ASTType::Void => {
+                    self.wat_file.write_all(b"\t\treturn\n").unwrap();
+                }
+                ASTType::I32 => {
+                    self.compile_expr(&r#return.value);
+                    self.wat_file.write_all(b"\t\treturn\n").unwrap();
+                }
+            },
+        }
+    }
+
+    fn compile_expr(&mut self, expr: &ASTExpr) {
+        match expr {
+            ASTExpr::Int(val) => {
+                let output = format!("\t\ti32.const {}\n", val);
+                self.wat_file.write_all(output.as_bytes()).unwrap();
+            }
+            ASTExpr::Variable(name) => {
+                let output = format!("\t\tlocal.get ${}\n", name);
+                self.wat_file.write_all(output.as_bytes()).unwrap();
+            }
+            ASTExpr::Binary(left, op, right) => {
+                self.compile_expr(left);
+                self.compile_expr(right);
+
+                let instr = match op {
+                    BinaryOp::Add => "\t\ti32.add\n",
+                    BinaryOp::Sub => "\t\ti32.sub\n",
+                    BinaryOp::Mul => "\t\ti32.mul\n",
+                    BinaryOp::Div => "\t\ti32.div_s\n",
+                };
+                self.wat_file.write_all(instr.as_bytes()).unwrap();
             }
         }
     }
@@ -470,7 +677,7 @@ fn main() {
     wasm_path.set_extension("wasm");
     let wasm_filename = wasm_path.to_string_lossy().into_owned();
 
-    let mut backend = Backend::new(wat_filename, String::from("main"), remc.program);
+    let mut backend = Backend::new(wat_filename, remc.program);
     backend.compile_program();
 
     let mut wat_text = String::new();
