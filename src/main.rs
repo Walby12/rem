@@ -1,4 +1,11 @@
-use std::{collections::HashMap, fs::*, io::prelude::*, io::*, process::exit, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::*,
+    io::prelude::*,
+    io::*,
+    process::exit,
+    sync::LazyLock,
+};
 use wasmtime::{Engine, Module};
 
 use clap::Parser;
@@ -73,6 +80,7 @@ enum ASTExpr {
     Int(i32),
     Variable(String),
     Binary(Box<ASTExpr>, BinaryOp, Box<ASTExpr>),
+    Call(String, Vec<ASTExpr>),
 }
 
 impl Default for ASTExpr {
@@ -113,9 +121,16 @@ enum ASTType {
     I32,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ASTParam {
+    name: String,
+    data_type: ASTType,
+}
+
 #[derive(Default, Debug, Clone)]
 struct ASTFuncDef {
     name: String,
+    params: Vec<ASTParam>,
     return_type: ASTType,
     body: Vec<ASTStmt>,
 }
@@ -142,11 +157,16 @@ enum Token {
     Minus,
     Asterisk,
     Slash,
+    Colon,
+    Comma,
     EOF,
 }
 
-static KEY_CHARS: LazyLock<Vec<u8>> =
-    LazyLock::new(|| vec![b'(', b')', b'{', b'}', b'=', b';', b'+', b'-', b'*', b'/']);
+static KEY_CHARS: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    vec![
+        b'(', b')', b'{', b'}', b'=', b';', b'+', b'-', b'*', b'/', b':', b',',
+    ]
+});
 
 struct Compiler {
     cur_tok: Token,
@@ -155,6 +175,7 @@ struct Compiler {
     line: usize,
     program: Vec<ASTNode>,
     vars: SymbolTable,
+    functions: HashMap<String, ASTFuncDef>,
 }
 
 impl Compiler {
@@ -166,6 +187,7 @@ impl Compiler {
             line: 1,
             program: Vec::new(),
             vars: SymbolTable::new(),
+            functions: HashMap::new(),
         }
     }
 
@@ -225,6 +247,14 @@ impl Compiler {
                 self.cur_tok = Token::Slash;
                 self.index += 1;
             }
+            b':' => {
+                self.cur_tok = Token::Colon;
+                self.index += 1;
+            }
+            b',' => {
+                self.cur_tok = Token::Comma;
+                self.index += 1;
+            }
             _ => {
                 if c.is_ascii_alphabetic() {
                     let mut buff: Vec<u8> = Vec::new();
@@ -232,8 +262,8 @@ impl Compiler {
                     while self.index < self.src.len() {
                         let current_byte = self.src[self.index];
 
-                        if current_byte.is_ascii_alphanumeric()
-                            || current_byte == b'_' && !KEY_CHARS.contains(&current_byte)
+                        if (current_byte.is_ascii_alphanumeric() || current_byte == b'_')
+                            && !KEY_CHARS.contains(&current_byte)
                         {
                             buff.push(current_byte);
                             self.index += 1;
@@ -329,15 +359,81 @@ impl Compiler {
         }
 
         self.lexe();
+        self.vars.clear();
+
+        if self.cur_tok != Token::CloseParen {
+            loop {
+                let mut param = ASTParam::default();
+
+                if let Token::Ident(ref p_name) = self.cur_tok {
+                    param.name = p_name.to_string();
+                } else {
+                    println!(
+                        "ERROR [line: {}]: Expected parameter name, got {:?}",
+                        self.line, self.cur_tok
+                    );
+                    exit(1);
+                }
+                self.lexe();
+
+                if self.cur_tok != Token::Colon {
+                    println!(
+                        "ERROR [line: {}]: Expected ':' after parameter name, got {:?}",
+                        self.line, self.cur_tok
+                    );
+                    exit(1);
+                }
+                self.lexe();
+
+                if let Token::Ident(ref p_type) = self.cur_tok {
+                    match p_type.as_str() {
+                        "i32" => param.data_type = ASTType::I32,
+                        _ => {
+                            println!(
+                                "ERROR [line: {}]: Unknown parameter type: {}",
+                                self.line, p_type
+                            );
+                            exit(1);
+                        }
+                    }
+                } else {
+                    println!(
+                        "ERROR [line: {}]: Expected parameter type, got {:?}",
+                        self.line, self.cur_tok
+                    );
+                    exit(1);
+                }
+                self.lexe();
+
+                function.params.push(param.clone());
+                self.vars.insert(param.name, param.data_type);
+
+                if self.cur_tok == Token::Comma {
+                    self.lexe();
+                } else if self.cur_tok == Token::CloseParen {
+                    break;
+                } else {
+                    println!(
+                        "ERROR [line: {}]: Expected ',' or ')' inside parameter list, got {:?}",
+                        self.line, self.cur_tok
+                    );
+                    exit(1);
+                }
+            }
+        }
+
         if self.cur_tok != Token::CloseParen {
             println!(
-                "ERROR [line: {}]: Excpected ')' after function name got: {:?}",
+                "ERROR [line: {}]: Expected ')' after parameter definitions, got: {:?}",
                 self.line, self.cur_tok
             );
             exit(1);
         }
-
         self.lexe();
+
+        self.functions
+            .insert(function.name.clone(), function.clone());
+
         if let Token::Ident(ref ret_type) = self.cur_tok {
             match ret_type.as_str() {
                 "i32" => function.return_type = ASTType::I32,
@@ -361,7 +457,6 @@ impl Compiler {
             exit(1);
         }
 
-        self.vars.clear();
         self.lexe();
         while self.cur_tok != Token::CloseCurly {
             function.body.push(self.parse_stmt(&function.return_type));
@@ -507,15 +602,71 @@ impl Compiler {
                 ASTExpr::Int(val)
             }
             Token::Ident(name) => {
-                if self.vars.lookup(&name).is_none() {
-                    println!(
-                        "ERROR [line: {}]: Use of undeclared identifier '{}'",
-                        self.line, name
-                    );
-                    exit(1);
-                }
                 self.lexe();
-                ASTExpr::Variable(name)
+
+                if self.cur_tok == Token::OpenParen {
+                    self.lexe();
+
+                    let mut args = Vec::new();
+
+                    if self.cur_tok != Token::CloseParen {
+                        loop {
+                            let arg_expr = self.parse_expr(0);
+                            args.push(arg_expr);
+
+                            if self.cur_tok == Token::Comma {
+                                self.lexe();
+                            } else if self.cur_tok == Token::CloseParen {
+                                break;
+                            } else {
+                                println!(
+                                    "ERROR [line: {}]: Expected ',' or ')' in function call arguments, got {:?}",
+                                    self.line, self.cur_tok
+                                );
+                                exit(1);
+                            }
+                        }
+                    }
+
+                    if self.cur_tok != Token::CloseParen {
+                        println!(
+                            "ERROR [line: {}]: Expected ')' after function call arguments",
+                            self.line
+                        );
+                        exit(1);
+                    }
+                    self.lexe();
+
+                    if let Some(target_fn) = self.functions.get(&name) {
+                        if target_fn.params.len() != args.len() {
+                            println!(
+                                "ERROR [line: {}]: Function '{}' expects {} arguments, but {} were provided.",
+                                self.line,
+                                name,
+                                target_fn.params.len(),
+                                args.len()
+                            );
+                            exit(1);
+                        }
+                    } else {
+                        println!(
+                            "ERROR [line: {}]: Call to undeclared function '{}'",
+                            self.line, name
+                        );
+                        exit(1);
+                    }
+
+                    ASTExpr::Call(name, args)
+                } else {
+                    if self.vars.lookup(&name).is_none() {
+                        println!(
+                            "ERROR [line: {}]: Use of undeclared identifier '{}'",
+                            self.line, name
+                        );
+                        exit(1);
+                    }
+                    ASTExpr::Variable(name)
+                }
             }
             Token::OpenParen => {
                 self.lexe();
@@ -597,18 +748,26 @@ impl Backend {
     }
 
     fn compile_func_def(&mut self, func: &ASTFuncDef) {
+        let mut params_wat = String::new();
+        for param in &func.params {
+            params_wat.push_str(&format!(" (param ${} i32)", param.name));
+        }
+
         let output = format!(
-            "\t(func ${} (export \"{}\"){}\n",
+            "\t(func ${} (export \"{}\"){}{}\n",
             func.name,
             func.name,
+            params_wat,
             self.type_to_string(&func.return_type)
         );
-
         self.wat_file.write_all(output.as_bytes()).unwrap();
 
+        let mut declared_locals = HashSet::new();
         for stmt in &func.body {
             if let ASTStmt::LetStmt(variable) = stmt {
-                writeln!(self.wat_file, "\t\t(local ${} i32)", variable.var_name).unwrap();
+                if declared_locals.insert(variable.var_name.clone()) {
+                    writeln!(self.wat_file, "\t\t(local ${} i32)", variable.var_name).unwrap();
+                }
             }
         }
 
@@ -665,6 +824,14 @@ impl Backend {
                     BinaryOp::Div => "\t\ti32.div_s\n",
                 };
                 self.wat_file.write_all(instr.as_bytes()).unwrap();
+            }
+            ASTExpr::Call(func_name, args) => {
+                for arg in args {
+                    self.compile_expr(arg);
+                }
+
+                let output = format!("\t\tcall ${}\n", func_name);
+                self.wat_file.write_all(output.as_bytes()).unwrap();
             }
         }
     }
