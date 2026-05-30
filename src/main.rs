@@ -93,13 +93,20 @@ struct ASTReturnStmt {
     function_ret_type: ASTType,
 }
 
+#[derive(Default, Debug, Clone)]
+struct ASTAssignmentStmt {
+    var_name: String,
+    value: ASTExpr,
+}
+
 #[derive(Debug, Clone)]
 enum ASTStmt {
     LetStmt(ASTLetStmt),
     ReturnStmt(ASTReturnStmt),
+    AssignmentStmt(ASTAssignmentStmt),
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq)]
 enum ASTType {
     #[default]
     Void,
@@ -373,6 +380,21 @@ impl Compiler {
             Token::Return => {
                 stmt = self.parse_return_stmt(return_type);
             }
+            Token::Ident(name) => {
+                if let Some(symbol) = self.vars.lookup(name) {
+                    if symbol.data_type != ASTType::I32 {
+                        println!("ERROR [line: {}]: Type mismatch!", self.line);
+                        exit(1);
+                    }
+                } else {
+                    println!(
+                        "ERROR [line: {}]: Variable '{}' not declared before assignment.",
+                        self.line, name
+                    );
+                    exit(1);
+                }
+                stmt = self.parse_assignment_stmt();
+            }
             _ => {
                 println!(
                     "ERROR [line: {}]: Unknow statement: {:?}",
@@ -392,6 +414,28 @@ impl Compiler {
 
         self.lexe();
         stmt
+    }
+
+    fn parse_assignment_stmt(&mut self) -> ASTStmt {
+        let mut stmt = ASTAssignmentStmt::default();
+
+        if let Token::Ident(name) = &self.cur_tok {
+            stmt.var_name = name.clone();
+        }
+        self.lexe();
+
+        if self.cur_tok != Token::Equals {
+            println!(
+                "ERROR [line: {}]: Expected '=' after variable name, got {:?}",
+                self.line, self.cur_tok
+            );
+            exit(1);
+        }
+        self.lexe();
+
+        stmt.value = self.parse_expr(0);
+
+        ASTStmt::AssignmentStmt(stmt)
     }
 
     fn parse_return_stmt(&mut self, return_type: &ASTType) -> ASTStmt {
@@ -592,6 +636,11 @@ impl Backend {
                     self.wat_file.write_all(b"\t\treturn\n").unwrap();
                 }
             },
+            ASTStmt::AssignmentStmt(variable) => {
+                self.compile_expr(&variable.value);
+                let output = format!("\t\tlocal.set ${}\n", variable.var_name);
+                self.wat_file.write_all(output.as_bytes()).unwrap();
+            }
         }
     }
 
